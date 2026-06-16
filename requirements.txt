@@ -1,0 +1,15 @@
+streamlit>=1.20.0
+langchain>=0.1.0
+langchain-core>=0.0.1
+langchain-community>=0.0.5
+langchain-text-splitters>=0.1.0
+langchain-ollama>=0.1.0
+ollama>=0.1.0
+pypdf>=3.10.0
+rank-bm25>=0.2.2
+faiss-cpu; platform_system!='Windows'
+# Note: On Windows, install faiss-cpu via conda-forge: `conda install -c conda-forge faiss-cpu`
+requests>=2.31.0
+numpy>=1.26.0
+python-dateutil>=2.8.2
+```

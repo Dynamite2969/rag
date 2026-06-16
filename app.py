@@ -2,6 +2,9 @@
 import os
 import tempfile
 from pathlib import Path
+import re
+import json
+from datetime import datetime
 import streamlit as st
 
 # Verify presence of the core LangChain and vector dependencies
@@ -231,17 +234,118 @@ def run_grounded_generation(query_text, retriever_engine, model_name, temp):
     # Attempt to invoke the chat model in a few common ways; fall back gracefully
     try:
         if hasattr(chat_model, "invoke"):
-            answer = chat_model.invoke(prompt_text)
+            raw_answer = chat_model.invoke(prompt_text)
         elif hasattr(chat_model, "generate"):
-            answer = chat_model.generate(prompt_text)
+            raw_answer = chat_model.generate(prompt_text)
         elif callable(chat_model):
-            answer = chat_model(prompt_text)
+            raw_answer = chat_model(prompt_text)
         else:
-            answer = "[Model invocation unavailable in this environment]"
+            raw_answer = "[Model invocation unavailable in this environment]"
     except Exception as gen_err:
-        answer = f"[Model generation failed: {gen_err}]"
+        raw_answer = f"[Model generation failed: {gen_err}]"
 
-    return answer, retrieved_chunks
+    # Post-process and polish the raw model output
+    gen_metadata = {
+        "model": model_name,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "polished": True,
+    }
+    answer = polish_answer(str(raw_answer), gen_metadata)
+
+    return answer, gen_metadata, retrieved_chunks
+
+
+def polish_answer(raw_text: str, meta: dict) -> str:
+    """Polish raw LLM output into a readable answer with basic formatting.
+
+    - Trim repeated boilerplate.
+    - Convert simple inline math like ax2 to ax^2 for readability.
+    - Ensure paragraphs are short and use bullet lists when appropriate.
+    - Attach a compact JSON metadata block at the end (hidden in UI via an expander).
+    """
+    # Normalize whitespace
+    text = re.sub(r"\s+", " ", raw_text).strip()
+
+    # Fix simple math tokens like x2 -> x^2, ax2 -> ax^2
+    text = re.sub(r"([A-Za-z0-9])2\b", r"\1^2", text)
+    text = re.sub(r"([A-Za-z0-9])3\b", r"\1^3", text)
+
+    # Add paragraph breaks after sentences followed by a space and capital letter
+    text = re.sub(r"\.\s+([A-Z])", r".\n\n\1", text)
+
+    # Shorten overly long intro boilerplate commonly produced by models
+    text = re.sub(r"To answer your question,.*?provided NCERT textbook context[.\s]*", "", text, flags=re.I)
+
+    # Append a compact metadata marker for UI display (JSON)
+    compact_meta = {k: meta.get(k) for k in ("model", "generated_at")}
+    text = text + "\n\n" + "[METADATA]" + json.dumps(compact_meta)
+    return text
+
+
+def _wrap_latex_expressions(text: str) -> str:
+    """Wrap simple caret-based power expressions with $...$ so Streamlit renders them as math.
+
+    Example: x^2 -> $x^2$
+    This is intentionally conservative to avoid wrapping plain text that uses ^ in other contexts.
+    """
+    def _repl(m):
+        base = m.group(1)
+        exp = m.group(2)
+        return f"${base}^{exp}$"
+
+    # Match alphanumeric (and underscore) base followed by ^ and a small integer exponent
+    return re.sub(r"\b([A-Za-z0-9_]+)\^([0-9]+)\b", _repl, text)
+
+
+def render_chat_block(role: str, content: str, citations: list | None = None, metadata: dict | None = None):
+    """Render a chat message with LaTeX-aware markdown and improved citations formatting.
+
+    - Separates and hides appended [METADATA] JSON if present.
+    - Wraps simple caret power expressions in $...$ for LaTeX rendering.
+    - Shows compact citation list with expandable full-context viewers.
+    """
+    # Separate metadata suffix if present
+    meta_obj = None
+    meta_marker = "[METADATA]"
+    if meta_marker in content:
+        try:
+            content, meta_json = content.split(meta_marker, 1)
+            meta_obj = json.loads(meta_json)
+        except Exception:
+            # leave content as-is if parsing fails
+            content = content
+
+    # Wrap simple power expressions so Streamlit will render math
+    rendered = _wrap_latex_expressions(content)
+
+    # Use markdown which supports $...$ math in Streamlit
+    st.markdown(rendered)
+
+    # Use provided metadata param or parsed meta_obj
+    if metadata is None and meta_obj is not None:
+        metadata = meta_obj
+
+    if metadata:
+        with st.expander("Response metadata"):
+            st.write(metadata)
+
+    # Render citations compactly
+    if citations:
+        with st.expander("Verified citations"):
+            for idx, ref in enumerate(citations):
+                source = ref.get("source", "Unknown")
+                page = ref.get("page", "N/A")
+                content_text = ref.get("content", "")
+                # show a short snippet first
+                snippet = content_text
+                if len(snippet) > 300:
+                    # trim to nearest word
+                    snippet = snippet[:300].rsplit(" ", 1)[0] + "..."
+                st.markdown(f"**[{idx+1}] {source}** — Page {page}")
+                st.markdown(f"> {snippet}")
+                with st.expander("Show full context"):
+                    # show full context in a code block for readability
+                    st.code(content_text, language="text")
 
 # --- MAIN INTERFACE RERUN LOOP ---
 st.title("🇮🇳 NCERT Classroom Conversational Assistant")
@@ -263,12 +367,12 @@ else:
 # Render chat history
 for message in st.session_state.chat_history:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if "citations" in message and message["citations"]:
-            with st.expander("Show Verified Citations"):
-                for idx, ref in enumerate(message["citations"]):
-                    st.write(f"**Reference [{idx+1}]**: {ref['source']} (Page {ref['page']})")
-                    st.caption(f"Context: {ref['content']}")
+        render_chat_block(
+            role=message["role"],
+            content=message["content"],
+            citations=message.get("citations", None),
+            metadata=message.get("generation_metadata", None),
+        )
 
 # Process new student inputs
 if user_prompt := st.chat_input("Ask a question about your science or history lessons..."):
@@ -289,7 +393,7 @@ if user_prompt := st.chat_input("Ask a question about your science or history le
                 
         # Step 2: Query the local RAG pipeline
         with st.spinner("Retrieving textbook segments and generating answer..."):
-            english_response, raw_citations = run_grounded_generation(
+            english_response, gen_metadata, raw_citations = run_grounded_generation(
                 active_query, retriever, local_llm_model, inference_temperature
             )
             
@@ -316,16 +420,17 @@ if user_prompt := st.chat_input("Ask a question about your science or history le
             
         # Step 4: Render response and citations to screen
         with st.chat_message("assistant"):
-            st.markdown(final_translated_response)
-            if formatted_references:
-                with st.expander("Show Verified Citations"):
-                    for idx, ref in enumerate(formatted_references):
-                        st.write(f"**Reference [{idx+1}]**: {ref['source']} (Page {ref['page']})")
-                        st.caption(f"Context: {ref['content']}")
+            render_chat_block(
+                role="assistant",
+                content=final_translated_response,
+                citations=formatted_references,
+                metadata=gen_metadata,
+            )
                         
         # Save interaction to session state
         st.session_state.chat_history.append({
             "role": "assistant",
             "content": final_translated_response,
-            "citations": formatted_references
+            "citations": formatted_references,
+            "generation_metadata": gen_metadata
         })
